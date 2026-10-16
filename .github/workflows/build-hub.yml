@@ -1,0 +1,107 @@
+# Build used by the zJu4nn Hub "Mashups" tab.
+# - The Minecraft Fabric mod (java/) is compiled HERE from this fork's source, at the upstream v0.1 commit (the
+#   release the ULTRAKILL plugin below belongs to — the plugin and the mod talk over shared memory and must match).
+# - The ULTRAKILL BepInEx plugin compiles against the game's own assemblies (not redistributable), so it is taken
+#   from the upstream v0.1 release, pinned by sha256 (zip, dll and the compiled shader bundle).
+# Upstream: https://github.com/Qua5eyeNimbl3/UltraCraft (MIT), bridge from SkyCraft (chasmlol) and PeakCraft
+# (aeironnsarmiento), both MIT. Published in the Hub with the author's permission and credit.
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v0.1-1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      SRC: b09f69921df2d46a7f682977adaaf3721def311a
+      UP_URL: https://github.com/Qua5eyeNimbl3/UltraCraft/releases/download/v0.1/UltraCraft-0.1.zip.-.Manual.Install
+      UP_SHA256: 5ffa82685527594274e010c081cb1ee77a35378f7a08ec592d3044e684cea952
+      PLUGIN_SHA256: bc37888a8cabb0ba7691cbb0a6a53ee96ad462c89c836ad6b603d3da187dd11f
+      SHADERS_SHA256: 0e59de3a4cf97bcb6530082e7fe30be59484dc89dc9b0f1861f8860858f046a4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SRC }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Fabric mod
+        shell: pwsh
+        run: |
+          $env:GRADLE_USER_HOME = Join-Path (Get-Location) '.tools\gradle-home'
+          .\java\gradlew.bat -p .\java --no-daemon --no-configuration-cache build -x test
+
+      - name: Upstream plugin (pinned)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:UP_URL -OutFile up.zip
+          $h = (Get-FileHash up.zip -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:UP_SHA256) { throw "upstream zip sha256 mismatch: $h" }
+          # the upstream zip uses backslashes in its entry names: read entries by name instead of Expand-Archive
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path up.zip).Path)
+          New-Item -ItemType Directory plugin -Force | Out-Null
+          foreach ($e in $z.Entries) {
+            $n = $e.FullName.Replace('\','/')
+            if ($n -eq 'ULTRAKILL/BepInEx/plugins/UltraCraft/UltraCraft.dll') { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path (Get-Location) 'plugin/UltraCraft.dll'), $true) }
+            if ($n -eq 'ULTRAKILL/BepInEx/plugins/UltraCraft/ultracraft-shaders') { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path (Get-Location) 'plugin/ultracraft-shaders'), $true) }
+            if ($n -eq 'Minecraft-instance/mods/ultracraft-java.jar') { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path (Get-Location) 'plugin/upstream-mod.jar'), $true) }
+          }
+          $z.Dispose()
+          $p = (Get-FileHash plugin/UltraCraft.dll -Algorithm SHA256).Hash.ToLower()
+          if ($p -ne $env:PLUGIN_SHA256) { throw "plugin dll sha256 mismatch: $p" }
+          $s = (Get-FileHash plugin/ultracraft-shaders -Algorithm SHA256).Hash.ToLower()
+          if ($s -ne $env:SHADERS_SHA256) { throw "shader bundle sha256 mismatch: $s" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = '0.1'
+          $jar = Get-ChildItem java/build/libs -Filter "*.jar" | Where-Object { $_.Name -notmatch 'sources' } | Select-Object -First 1
+          if (!$jar) { throw "mod jar not found" }
+          "our mod jar: $($jar.Length) bytes / upstream: $((Get-Item plugin/upstream-mod.jar).Length) bytes"
+          $p = 'pkg'
+          New-Item -ItemType Directory "$p/BepInEx/plugins/UltraCraft","$p/mods" -Force | Out-Null
+          Copy-Item plugin/UltraCraft.dll "$p/BepInEx/plugins/UltraCraft/UltraCraft.dll"
+          Copy-Item plugin/ultracraft-shaders "$p/BepInEx/plugins/UltraCraft/ultracraft-shaders"
+          # the MIT LICENSE file was added after v0.1: take it from main
+          Invoke-WebRequest "https://raw.githubusercontent.com/${{ github.repository }}/main/LICENSE" -OutFile "$p/BepInEx/plugins/UltraCraft/LICENSE.txt"
+          Copy-Item THIRD-PARTY "$p/BepInEx/plugins/UltraCraft/THIRD-PARTY" -Recurse
+          Copy-Item $jar.FullName "$p/mods/ultracraft-java-$ver.jar"
+          @(
+            "UltraCraft $ver (build do zJu4nn Hub)",
+            '',
+            'ULTRAKILL num mundo de Minecraft de verdade. Original de Qua5eyeNimbl3',
+            '(github.com/Qua5eyeNimbl3/UltraCraft), publicado no Hub com a permissao e os creditos do autor.',
+            'Ponte baseada no SkyCraft (chasmlol) e no PeakCraft (aeironnsarmiento). Licenca MIT.',
+            'Projeto de fas, sem ligacao com New Blood Interactive, Mojang ou Microsoft.'
+          ) | Set-Content "$p/LEIA.txt" -Encoding utf8
+          $sums = Get-ChildItem $p -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $p).Path.Length + 1).Replace('\','/')
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $rel"
+          }
+          $sums | Set-Content "$p/SHA256SUMS.txt" -Encoding ascii
+          $sums
+          $zip = "ultracraft-hub-$ver.zip"
+          Compress-Archive -Path "$p/*" -DestinationPath $zip
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VER=$ver" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" $env:ZIP --repo "${{ github.repository }}" --target main --title "UltraCraft $env:VER (zJu4nn Hub)" --notes "Build of Qua5eyeNimbl3/UltraCraft $env:VER for the zJu4nn Hub Mashups tab, with the author's permission. Minecraft mod compiled from this fork at $env:SRC; the ULTRAKILL plugin and shader bundle are the upstream v0.1 files (dll sha256 $env:PLUGIN_SHA256). MIT."
